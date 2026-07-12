@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prisma Client生成
+        run: npx prisma generate --schema packages/db/prisma/schema.prisma
+
+      - name: モジュール境界チェック（ドメイン間の直接依存を機械的に検知）
+        run: npm run check:deps
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit test
+        run: npm run test
+
+  # 様式改正時の受け入れテスト（10章）は、実際の政府様式ファイルを用いた
+  # 目視チェックを含むためCIには組み込まず、リリースチェックリスト側で運用する。

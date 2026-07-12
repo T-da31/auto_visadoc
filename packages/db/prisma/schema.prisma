@@ -1,0 +1,220 @@
+// 戦略メモ 4.5章に基づく初期スキーマ雛形。
+// - PostgreSQL単一インスタンス、ドメインごとに CREATE SCHEMA で論理分離。
+// - 各テーブルは今後の詳細DB設計（未着手）で拡張される前提の最小骨格。
+// - RLS（テナント間データ分離）を見据え、テナントに紐づくテーブルには tenantId を持たせる。
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["multiSchema"]
+  output          = "../generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["core", "gaikokujinzai", "tokutei_ginou", "ikusei_shurou", "chouhyou"]
+}
+
+// ---------------------------------------------------------------------------
+// core: テナント／アカウント／認可・監査など、ドメイン非依存の基盤テーブル
+// （7章：受入企業を主体とし、行政書士・登録支援機関は招待制サブアカウント）
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  COMPANY_ADMIN
+  COMPANY_STAFF
+  GYOSEI_SHOSHI
+  SHIEN_KIKAN
+
+  @@schema("core")
+}
+
+enum PlanTier {
+  FREE
+  BASIC
+  PRO
+
+  @@schema("core")
+}
+
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  planTier  PlanTier @default(FREE)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users User[]
+
+  @@schema("core")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id])
+  email     String   @unique
+  role      UserRole
+  createdAt DateTime @default(now())
+
+  @@index([tenantId])
+  @@schema("core")
+}
+
+// 誰が入力し、誰が承認・提出したかの監査証跡（7章）
+model AuditLog {
+  id         String   @id @default(uuid())
+  tenantId   String
+  actorId    String
+  action     String
+  targetType String
+  targetId   String
+  occurredAt DateTime @default(now())
+
+  @@index([tenantId, occurredAt])
+  @@schema("core")
+}
+
+// ---------------------------------------------------------------------------
+// gaikokujinzai: 外国人材データ（6章：最大の資産、独立管理）
+// ---------------------------------------------------------------------------
+
+enum IdentifierType {
+  PASSPORT
+  RESIDENCE_CARD
+
+  @@schema("gaikokujinzai")
+}
+
+// 個人の一意性は内部発行IDを主キーとし、パスポート/在留カード番号は
+// 更新のたびに変わる前提で「識別子の履歴」として複数保持する（6章）。
+model ForeignWorker {
+  id            String   @id @default(uuid())
+  familyName    String
+  givenName     String
+  familyNameKana String?
+  givenNameKana  String?
+  dateOfBirth   DateTime
+  nationality   String
+  gender        String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  identifiers  IdentifierHistory[]
+  affiliations Affiliation[]
+
+  @@schema("gaikokujinzai")
+}
+
+model IdentifierHistory {
+  id              String         @id @default(uuid())
+  foreignWorkerId String
+  foreignWorker   ForeignWorker  @relation(fields: [foreignWorkerId], references: [id])
+  type            IdentifierType
+  number          String
+  issuedAt        DateTime?
+  expiredAt       DateTime?
+  isActive        Boolean        @default(true)
+  createdAt       DateTime       @default(now())
+
+  @@index([foreignWorkerId])
+  @@schema("gaikokujinzai")
+}
+
+// 外国人材と受入企業の「所属」。SCD Type2的な履歴管理（6章）。
+// 転籍・転職時は現行レコードにendDateを設定し新規レコードを追加する。
+model Affiliation {
+  id                String    @id @default(uuid())
+  tenantId          String
+  foreignWorkerId   String
+  foreignWorker     ForeignWorker @relation(fields: [foreignWorkerId], references: [id])
+  residenceStatus   String
+  startDate         DateTime
+  endDate           DateTime?
+  createdAt         DateTime  @default(now())
+
+  @@index([tenantId])
+  @@index([foreignWorkerId])
+  @@schema("gaikokujinzai")
+}
+
+// ---------------------------------------------------------------------------
+// tokutei_ginou: 特定技能ドメイン
+// ---------------------------------------------------------------------------
+
+model VisaApplication {
+  id              String   @id @default(uuid())
+  tenantId        String
+  foreignWorkerId String
+  applicationType String
+  status          String   @default("DRAFT")
+  submittedAt     DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([foreignWorkerId])
+  @@schema("tokutei_ginou")
+}
+
+// ---------------------------------------------------------------------------
+// ikusei_shurou: 育成就労ドメイン
+// ---------------------------------------------------------------------------
+
+model TrainingPlan {
+  id              String   @id @default(uuid())
+  tenantId        String
+  foreignWorkerId String
+  status          String   @default("DRAFT")
+  startDate       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([foreignWorkerId])
+  @@schema("ikusei_shurou")
+}
+
+// ---------------------------------------------------------------------------
+// chouhyou: 帳票エンジン。他ドメインの事情を知らず「テンプレート×データ」の
+// 契約のみで完結させる（4章）。foreignWorkerId等は不透明な参照文字列として
+// 保持し、外部キー・リレーションは張らない。
+// 要配慮個人情報を含む書類（健康診断書等）はステートレス生成とし、
+// このスキーマには保存しない（6章）。
+// ---------------------------------------------------------------------------
+
+enum DocumentFormat {
+  DOCX
+  XLSX
+
+  @@schema("chouhyou")
+}
+
+model DocumentTemplate {
+  id             String         @id @default(uuid())
+  key            String
+  name           String
+  version        String
+  format         DocumentFormat
+  isUserProvided Boolean        @default(false)
+  tenantId       String?
+  createdAt      DateTime       @default(now())
+
+  generations DocumentGeneration[]
+
+  @@unique([key, version, tenantId])
+  @@schema("chouhyou")
+}
+
+model DocumentGeneration {
+  id               String           @id @default(uuid())
+  tenantId         String
+  templateId       String
+  template         DocumentTemplate @relation(fields: [templateId], references: [id])
+  generatedBy      String
+  generatedAt      DateTime         @default(now())
+  targetRefId      String? // 例: foreignWorkerId。他スキーマへのFKは張らない。
+
+  @@index([tenantId, generatedAt])
+  @@schema("chouhyou")
+}
