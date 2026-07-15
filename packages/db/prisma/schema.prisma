@@ -2,7 +2,11 @@
 // - PostgreSQL単一インスタンス、ドメインごとに CREATE SCHEMA で論理分離（4章）。
 // - 可変が大きい書類のフォーム項目はJSONBに逃がし、コア部分（状態・承認・監査・
 //   テンプレートバージョン）のみリレーショナルに管理する（4.5章の設計方針）。
-// - RLS（テナント間データ分離）を見据え、テナントに紐づくテーブルには tenantId を持たせる。
+// - RLS（テナント間データ分離）：tenantId を持つテーブルには
+//   prisma/migrations/20260715120100_add_row_level_security/migration.sql で
+//   ポリシーを設定済み。Prisma schema自体にRLSのDSLは無いため、このファイルの
+//   モデル定義だけを見てもRLSの存在は分からない点に注意（マイグレーション運用
+//   ルールは同migrationファイルの先頭コメント参照）。
 // - Prismaは1ファイル内でモデル/enum名がスキーマ横断でユニークである必要があるため、
 //   ドメインを跨いで名前が衝突しないよう接頭辞を付けている（例: TokuteiGinou*）。
 
@@ -148,6 +152,9 @@ model ConsentRecord {
 
 // 11章：決済基盤。MVP期は手動請求書＋銀行振込。Stripe等への移行時もこのテーブルの
 // 生成元をWebhookに差し替えるだけで済む想定。
+// インボイス制度対応：適格請求書として税率ごとの内訳・発行事業者登録番号の記載が
+// 必須のため、発行時点の値をスナップショットとして保持する（登録番号は自社の
+// 適格請求書発行事業者番号であり将来変わり得るため、後から算出せず発行時点の値を残す）。
 model Invoice {
   id                       String    @id @default(uuid())
   tenantId                 String
@@ -155,9 +162,12 @@ model Invoice {
   periodStart              DateTime
   periodEnd                DateTime
   activeForeignWorkerCount Int
-  flatFeeAmount            Int
-  usageFeeAmount           Int
-  totalAmount              Int
+  flatFeeAmount            Int // 税抜
+  usageFeeAmount           Int // 税抜
+  taxRate                  Decimal   @default(0.10) @db.Decimal(4, 3)
+  taxAmount                Int
+  totalAmount              Int // flatFeeAmount + usageFeeAmount + taxAmount（税込）
+  issuerRegisteredNumber   String? // 適格請求書発行事業者登録番号（発行時点のスナップショット）
   status                   String    @default("DRAFT") // DRAFT / ISSUED / PAID
   issuedAt                 DateTime?
   paidAt                   DateTime?
@@ -226,6 +236,9 @@ model ForeignWorker {
   healthCheckupProgress     HealthCheckupProgress[]
   attachmentChecklistItems  AttachmentChecklistItem[]
 
+  // 6章：名寄せ候補探索（氏名表記ゆれ・生年月日・国籍・性別によるスコアリング）の
+  // 事前絞り込みクエリを高速化するための複合インデックス。
+  @@index([familyName, givenName, dateOfBirth])
   @@schema("gaikokujinzai")
 }
 
@@ -245,6 +258,9 @@ model IdentifierHistory {
   createdAt            DateTime       @default(now())
 
   @@index([foreignWorkerId])
+  // 9.5章：在留カード等番号失効情報照会APIとの突合、および手入力・CSV・OCRいずれの
+  // 経路でも番号の重複入力チェックに使う検索用インデックス。
+  @@index([type, number])
   @@schema("gaikokujinzai")
 }
 
