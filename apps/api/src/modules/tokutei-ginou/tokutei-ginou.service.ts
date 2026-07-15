@@ -1,15 +1,121 @@
-import { Injectable } from "@nestjs/common";
+import { ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { getPrismaClient } from "@tokutei-ginou/db";
+import type {
+  CreateTokuteiGinouDocumentCaseDto,
+  TokuteiGinouDocumentCaseDto,
+  TokuteiGinouDocumentType,
+} from "@tokutei-ginou/shared";
+import { ChouhyouService, type GeneratedDocument } from "../chouhyou";
 
-// 特定技能ドメインの雛形サービス。詳細なDB設計・ユースケースは
-// 実装ロードマップ（戦略メモ9章）に沿って段階的に拡張する。
+// documentType → chouhyouの帳票テンプレートキーの対応（4.7章のデータ辞書相当）。
+// フェーズ1（雇用条件書・雇用契約書）以外は未実装のため、対応するキーが無い
+// ものは生成時にエラーとする。9章の実装ロードマップに沿って順次追加する。
+const TEMPLATE_KEY_BY_DOCUMENT_TYPE: Partial<Record<TokuteiGinouDocumentType, string>> = {
+  EMPLOYMENT_CONDITION_NOTICE: "employment_condition_notice",
+};
+
+// 特定技能ドメインのサービス。9章の実装ロードマップに登場する書類は、
+// 可変フォーム項目をJSONBに逃がした汎用ケースモデル
+// （TokuteiGinouDocumentCase）で扱う。
+//
+// 7章の承認フロー：行政書士・登録支援機関（サブアカウント）が入力した内容は
+// DRAFTのまま留め、受入企業側の承認（approve）を経てはじめてSUBMITTED可能な
+// 状態に確定させる。
 @Injectable()
 export class TokuteiGinouService {
+  constructor(private readonly chouhyou: ChouhyouService) {}
+
   private get prisma() {
     return getPrismaClient();
   }
 
-  async listByTenant(tenantId: string) {
-    return this.prisma.visaApplication.findMany({ where: { tenantId } });
+  async listByTenant(
+    tenantId: string,
+    documentType?: string,
+  ): Promise<TokuteiGinouDocumentCaseDto[]> {
+    return this.prisma.tokuteiGinouDocumentCase.findMany({
+      where: { tenantId, ...(documentType ? { documentType } : {}) },
+      orderBy: { createdAt: "desc" },
+    });
+  }
+
+  async create(
+    tenantId: string,
+    createdByUserId: string,
+    input: CreateTokuteiGinouDocumentCaseDto,
+  ): Promise<TokuteiGinouDocumentCaseDto> {
+    return this.prisma.tokuteiGinouDocumentCase.create({
+      data: {
+        tenantId,
+        foreignWorkerId: input.foreignWorkerId,
+        documentType: input.documentType,
+        templateVersion: input.templateVersion,
+        formData: input.formData,
+        createdByUserId,
+        status: "DRAFT",
+      },
+    });
+  }
+
+  // 受入企業側の承認。行政書士・登録支援機関のサブアカウントには承認権限を
+  // 与えない想定のため、呼び出し元（コントローラ／認可ガード）で
+  // COMPANY_ADMIN/COMPANY_STAFF ロールのみに制限する。
+  async approve(
+    tenantId: string,
+    caseId: string,
+    approvedByUserId: string,
+  ): Promise<TokuteiGinouDocumentCaseDto> {
+    const documentCase = await this.prisma.tokuteiGinouDocumentCase.findFirst({
+      where: { id: caseId, tenantId },
+    });
+
+    if (!documentCase) {
+      throw new NotFoundException(`DocumentCase ${caseId} not found`);
+    }
+
+    if (documentCase.status === "SUBMITTED") {
+      throw new ForbiddenException("提出済みの書類は承認できません");
+    }
+
+    return this.prisma.tokuteiGinouDocumentCase.update({
+      where: { id: caseId },
+      data: {
+        status: "APPROVED",
+        approvedByUserId,
+        approvedAt: new Date(),
+      },
+    });
+  }
+
+  // formData（JSONB）を帳票エンジンへそのまま渡し、docxを生成する。
+  // 承認前（DRAFT）でもプレビュー目的で呼び出せる想定（4.7章：試し差し込み機能）。
+  async generateDocument(
+    tenantId: string,
+    generatedByUserId: string,
+    caseId: string,
+  ): Promise<GeneratedDocument> {
+    const documentCase = await this.prisma.tokuteiGinouDocumentCase.findFirst({
+      where: { id: caseId, tenantId },
+    });
+
+    if (!documentCase) {
+      throw new NotFoundException(`DocumentCase ${caseId} not found`);
+    }
+
+    const templateKey =
+      TEMPLATE_KEY_BY_DOCUMENT_TYPE[documentCase.documentType as TokuteiGinouDocumentType];
+
+    if (!templateKey) {
+      throw new ForbiddenException(
+        `書類種別 ${documentCase.documentType} の帳票生成は未対応です`,
+      );
+    }
+
+    return this.chouhyou.generate(tenantId, generatedByUserId, {
+      templateKey,
+      templateVersion: documentCase.templateVersion ?? undefined,
+      format: "DOCX",
+      data: documentCase.formData as Record<string, unknown>,
+    });
   }
 }

@@ -1,7 +1,10 @@
-// 戦略メモ 4.5章に基づく初期スキーマ雛形。
-// - PostgreSQL単一インスタンス、ドメインごとに CREATE SCHEMA で論理分離。
-// - 各テーブルは今後の詳細DB設計（未着手）で拡張される前提の最小骨格。
+// 戦略メモ全体（4〜11章）を反映した詳細スキーマ。
+// - PostgreSQL単一インスタンス、ドメインごとに CREATE SCHEMA で論理分離（4章）。
+// - 可変が大きい書類のフォーム項目はJSONBに逃がし、コア部分（状態・承認・監査・
+//   テンプレートバージョン）のみリレーショナルに管理する（4.5章の設計方針）。
 // - RLS（テナント間データ分離）を見据え、テナントに紐づくテーブルには tenantId を持たせる。
+// - Prismaは1ファイル内でモデル/enum名がスキーマ横断でユニークである必要があるため、
+//   ドメインを跨いで名前が衝突しないよう接頭辞を付けている（例: TokuteiGinou*）。
 
 generator client {
   provider        = "prisma-client-js"
@@ -15,16 +18,16 @@ datasource db {
   schemas  = ["core", "gaikokujinzai", "tokutei_ginou", "ikusei_shurou", "chouhyou"]
 }
 
-// ---------------------------------------------------------------------------
-// core: テナント／アカウント／認可・監査など、ドメイン非依存の基盤テーブル
-// （7章：受入企業を主体とし、行政書士・登録支援機関は招待制サブアカウント）
-// ---------------------------------------------------------------------------
+// =============================================================================
+// core: テナント／アカウント／認可・同意・監査など、ドメイン非依存の基盤テーブル
+// =============================================================================
 
 enum UserRole {
-  COMPANY_ADMIN
+  COMPANY_ADMIN // 受入企業アカウント（主体・承認権限）
   COMPANY_STAFF
-  GYOSEI_SHOSHI
-  SHIEN_KIKAN
+  GYOSEI_SHOSHI // 行政書士（招待制サブアカウント・代理入力のみ）
+  SHIEN_KIKAN // 登録支援機関（招待制サブアカウント・代理入力のみ）
+  PLATFORM_OPERATOR // 運営側スタッフ（データ入稿代行等、9.5章）
 
   @@schema("core")
 }
@@ -44,40 +47,146 @@ model Tenant {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  users User[]
+  users            User[]
+  invitations      Invitation[]
+  consentRecords   ConsentRecord[]
+  invoices         Invoice[]
+  proxyEntryGrants ProxyDataEntryGrant[]
 
   @@schema("core")
 }
 
+// 7章：受入企業アカウントが主体。行政書士・登録支援機関は招待制サブアカウントで
+// 代理入力権限のみを持ち、入力内容は「下書き」に留まり受入企業側の承認を要する
+// （承認フローは各ドメインのDocumentCase系モデルのstatusで表現）。
 model User {
-  id        String   @id @default(uuid())
+  id        String    @id @default(uuid())
   tenantId  String
-  tenant    Tenant   @relation(fields: [tenantId], references: [id])
-  email     String   @unique
+  tenant    Tenant    @relation(fields: [tenantId], references: [id])
+  email     String    @unique
   role      UserRole
-  createdAt DateTime @default(now())
+  invitedById String?
+  disabledAt  DateTime?
+  createdAt DateTime  @default(now())
 
   @@index([tenantId])
   @@schema("core")
 }
 
-// 誰が入力し、誰が承認・提出したかの監査証跡（7章）
+model Invitation {
+  id            String    @id @default(uuid())
+  tenantId      String
+  tenant        Tenant    @relation(fields: [tenantId], references: [id])
+  email         String
+  role          UserRole
+  invitedByUserId String
+  token         String    @unique
+  expiresAt     DateTime
+  acceptedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([tenantId])
+  @@schema("core")
+}
+
+// 9.5章：データ入稿代行の運用体制。依頼された案件のみ一時的な閲覧・入力権限を
+// 付与し、完了後は権限を剥奪する（最小権限の原則）。付与・剥奪自体も監査対象。
+model ProxyDataEntryGrant {
+  id              String    @id @default(uuid())
+  tenantId        String
+  tenant          Tenant    @relation(fields: [tenantId], references: [id])
+  grantedToUserId String
+  scope           String // 対象案件の説明（例: 対象ForeignWorkerId一覧、書類種別等）
+  grantedAt       DateTime  @default(now())
+  revokedAt       DateTime?
+
+  @@index([tenantId])
+  @@schema("core")
+}
+
+// 7章：誰が入力し、誰が承認・提出したかの監査証跡。
+// 健康診断書（要配慮個人情報）については「生成した事実（日時・実行者）」のみを
+// 記録し、入力内容（受診結果等）はmetadataにも一切含めない（6章）。
 model AuditLog {
   id         String   @id @default(uuid())
   tenantId   String
-  actorId    String
-  action     String
+  actorUserId String
+  action     String // 例: DOCUMENT_CASE_APPROVED, DOCUMENT_GENERATED, STATUS_CHANGE_PROCESSED
   targetType String
   targetId   String
+  metadata   Json?
   occurredAt DateTime @default(now())
 
   @@index([tenantId, occurredAt])
   @@schema("core")
 }
 
-// ---------------------------------------------------------------------------
-// gaikokujinzai: 外国人材データ（6章：最大の資産、独立管理）
-// ---------------------------------------------------------------------------
+// 8章：二次利用（流用）の同意はアカウント／データ継続とは完全に分離し、
+// 用途ごとに独立オプトイン（デフォルトOFF・いつでも撤回可）とする。
+enum ConsentCategory {
+  SERVICE_IMPROVEMENT_ANALYTICS // 自社サービス改善のための分析利用（匿名加工・統計処理前提）
+  ANONYMIZED_INDUSTRY_REPORT // 匿名加工情報化した上での業界レポート等への利用
+  THIRD_PARTY_MATCHING // 人材データベース事業における第三者マッチング目的での提供
+  THIRD_PARTY_PROVISION // 提携先（金融・住宅等）への第三者提供
+
+  @@schema("core")
+}
+
+model ConsentRecord {
+  id              String    @id @default(uuid())
+  tenantId        String
+  tenant          Tenant    @relation(fields: [tenantId], references: [id])
+  category        ConsentCategory
+  grantedAt       DateTime?
+  revokedAt       DateTime?
+  updatedByUserId String?
+  createdAt       DateTime  @default(now())
+
+  @@unique([tenantId, category])
+  @@schema("core")
+}
+
+// 11章：決済基盤。MVP期は手動請求書＋銀行振込。Stripe等への移行時もこのテーブルの
+// 生成元をWebhookに差し替えるだけで済む想定。
+model Invoice {
+  id                       String    @id @default(uuid())
+  tenantId                 String
+  tenant                   Tenant    @relation(fields: [tenantId], references: [id])
+  periodStart              DateTime
+  periodEnd                DateTime
+  activeForeignWorkerCount Int
+  flatFeeAmount            Int
+  usageFeeAmount           Int
+  totalAmount              Int
+  status                   String    @default("DRAFT") // DRAFT / ISSUED / PAID
+  issuedAt                 DateTime?
+  paidAt                   DateTime?
+  createdAt                DateTime  @default(now())
+
+  @@index([tenantId, periodStart])
+  @@schema("core")
+}
+
+// 9.5章：Excel/CSVインポートのフォーマットバージョニング運用ログ。
+// 実際の変換ロジック・列マッピング定義はコード側でバージョンごとに管理する。
+model DataImportBatch {
+  id                  String    @id @default(uuid())
+  tenantId            String
+  sourceFormatVersion String
+  importedByUserId    String
+  status              String // PROCESSING / COMPLETED / FAILED
+  rowCount            Int?
+  errorSummary        Json?
+  createdAt           DateTime  @default(now())
+  completedAt         DateTime?
+
+  @@index([tenantId, createdAt])
+  @@schema("core")
+}
+
+// =============================================================================
+// gaikokujinzai: 外国人材データ（6章：最大の資産、他ドメインから独立管理）
+// =============================================================================
 
 enum IdentifierType {
   PASSPORT
@@ -88,34 +197,52 @@ enum IdentifierType {
 
 // 個人の一意性は内部発行IDを主キーとし、パスポート/在留カード番号は
 // 更新のたびに変わる前提で「識別子の履歴」として複数保持する（6章）。
+// 育成就労ではパスポート取得前（応募段階）から人材データが発生するため、
+// 識別子が1件もない状態でもレコードを作成できる。
 model ForeignWorker {
-  id            String   @id @default(uuid())
-  familyName    String
-  givenName     String
+  id             String   @id @default(uuid())
+  familyName     String
+  givenName      String
   familyNameKana String?
   givenNameKana  String?
-  dateOfBirth   DateTime
-  nationality   String
-  gender        String
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  dateOfBirth    DateTime
+  nationality    String
+  gender         String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  identifiers  IdentifierHistory[]
-  affiliations Affiliation[]
+  identifiers           IdentifierHistory[]
+  affiliations          Affiliation[]
+  statusChangeRequests  StatusChangeRequest[]
+  matchCandidatesAsSource ForeignWorkerMatchCandidate[] @relation("MatchSource")
+  matchCandidatesAsCandidate ForeignWorkerMatchCandidate[] @relation("MatchCandidate")
+  mergeRecordsAsSource  ForeignWorkerMergeRecord[] @relation("MergeSource")
+  mergeRecordsAsTarget  ForeignWorkerMergeRecord[] @relation("MergeTarget")
+
+  // tokutei_ginouスキーマ側からの参照（cross-schema relation）に対応する
+  // 逆方向フィールド。ForeignWorker自体はどのドメインの書類が存在するかを
+  // 一切気にしない（6章：外国人材データは他ドメインから独立管理）。
+  tokuteiGinouDocumentCases TokuteiGinouDocumentCase[]
+  healthCheckupProgress     HealthCheckupProgress[]
+  attachmentChecklistItems  AttachmentChecklistItem[]
 
   @@schema("gaikokujinzai")
 }
 
+// 9.5章：在留カード等番号失効情報照会APIとの突合結果を保持し、手入力・CSV
+// インポート・OCRいずれの入力経路でも共通の品質チェックとして利用する。
 model IdentifierHistory {
-  id              String         @id @default(uuid())
-  foreignWorkerId String
-  foreignWorker   ForeignWorker  @relation(fields: [foreignWorkerId], references: [id])
-  type            IdentifierType
-  number          String
-  issuedAt        DateTime?
-  expiredAt       DateTime?
-  isActive        Boolean        @default(true)
-  createdAt       DateTime       @default(now())
+  id                   String         @id @default(uuid())
+  foreignWorkerId      String
+  foreignWorker        ForeignWorker  @relation(fields: [foreignWorkerId], references: [id])
+  type                 IdentifierType
+  number               String
+  issuedAt             DateTime?
+  expiredAt            DateTime?
+  isActive             Boolean        @default(true)
+  isRevoked            Boolean        @default(false)
+  revocationCheckedAt  DateTime?
+  createdAt            DateTime       @default(now())
 
   @@index([foreignWorkerId])
   @@schema("gaikokujinzai")
@@ -123,65 +250,221 @@ model IdentifierHistory {
 
 // 外国人材と受入企業の「所属」。SCD Type2的な履歴管理（6章）。
 // 転籍・転職時は現行レコードにendDateを設定し新規レコードを追加する。
+// 11章：この履歴テーブルが従量課金（アクティブ外国人材数）の情報源になる。
 model Affiliation {
-  id                String    @id @default(uuid())
-  tenantId          String
-  foreignWorkerId   String
-  foreignWorker     ForeignWorker @relation(fields: [foreignWorkerId], references: [id])
-  residenceStatus   String
-  startDate         DateTime
-  endDate           DateTime?
-  createdAt         DateTime  @default(now())
+  id              String    @id @default(uuid())
+  tenantId        String
+  foreignWorkerId String
+  foreignWorker   ForeignWorker @relation(fields: [foreignWorkerId], references: [id])
+  residenceStatus String
+  startDate       DateTime
+  endDate         DateTime?
+  createdAt       DateTime  @default(now())
+
+  statusChangeRequests StatusChangeRequest[]
 
   @@index([tenantId])
   @@index([foreignWorkerId])
   @@schema("gaikokujinzai")
 }
 
-// ---------------------------------------------------------------------------
+// 11章：退職・帰国・消息不明は単なるデータ編集ではなく監査証跡を伴う
+// 「ステータス変更手続き」として実装。手続き完了月の翌月から課金対象外とする。
+// 「消息不明」は出入国在留管理庁への届出義務があるため、将来的に届出書生成と
+// セットにすることを想定し、reasonTypeで区別しておく。
+model StatusChangeRequest {
+  id                String    @id @default(uuid())
+  tenantId          String
+  foreignWorkerId   String
+  foreignWorker     ForeignWorker @relation(fields: [foreignWorkerId], references: [id])
+  affiliationId     String
+  affiliation       Affiliation   @relation(fields: [affiliationId], references: [id])
+  reasonType        String // RESIGNATION / RETURNED_HOME / WHEREABOUTS_UNKNOWN
+  requestedByUserId String
+  requestedAt       DateTime  @default(now())
+  processedAt       DateTime?
+  status            String    @default("PENDING") // PENDING / PROCESSED
+
+  @@index([tenantId, status])
+  @@schema("gaikokujinzai")
+}
+
+// 6章：帰国後の再来日等における名寄せは完全自動化が困難なため、
+// 氏名（表記ゆれ考慮）・生年月日・国籍・性別等でスコアリングし、一致度が高い
+// 場合に入力担当者へ提示、確認・マージまたは棄却させる人間参加型フロー。
+enum MatchCandidateStatus {
+  PENDING_REVIEW
+  CONFIRMED_MERGE
+  REJECTED
+
+  @@schema("gaikokujinzai")
+}
+
+model ForeignWorkerMatchCandidate {
+  id                String   @id @default(uuid())
+  foreignWorkerId   String
+  foreignWorker     ForeignWorker @relation("MatchSource", fields: [foreignWorkerId], references: [id])
+  candidateId       String
+  candidate         ForeignWorker @relation("MatchCandidate", fields: [candidateId], references: [id])
+  score             Float // 一致度スコア（氏名表記ゆれ・生年月日・国籍・性別等の合成）
+  status            MatchCandidateStatus @default(PENDING_REVIEW)
+  reviewedByUserId  String?
+  reviewedAt        DateTime?
+  createdAt         DateTime @default(now())
+
+  @@index([foreignWorkerId])
+  @@index([candidateId])
+  @@schema("gaikokujinzai")
+}
+
+// 誤マージに備え、マージ履歴とマージ取り消し（unmerge）を可能にする（6章）。
+model ForeignWorkerMergeRecord {
+  id             String    @id @default(uuid())
+  sourceId       String
+  source         ForeignWorker @relation("MergeSource", fields: [sourceId], references: [id])
+  targetId       String
+  target         ForeignWorker @relation("MergeTarget", fields: [targetId], references: [id])
+  mergedByUserId String
+  mergedAt       DateTime  @default(now())
+  unmergedAt     DateTime?
+  reason         String?
+
+  @@index([sourceId])
+  @@index([targetId])
+  @@schema("gaikokujinzai")
+}
+
+// =============================================================================
 // tokutei_ginou: 特定技能ドメイン
-// ---------------------------------------------------------------------------
+// 9章の実装ロードマップに登場する書類を、可変フォーム項目をJSONBに逃がした
+// 汎用ケースモデル（TokuteiGinouDocumentCase）で表現する。書類ごとに専用の
+// テーブルを増やさず、様式改正の追従コストを帳票側（chouhyou-engine）の
+// テンプレート差し替えに閉じ込める設計方針（4章・4.5章）に合わせている。
+// =============================================================================
 
-model VisaApplication {
-  id              String   @id @default(uuid())
-  tenantId        String
-  foreignWorkerId String
-  applicationType String
-  status          String   @default("DRAFT")
-  submittedAt     DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+enum TokuteiGinouDocumentType {
+  EMPLOYMENT_CONDITION_NOTICE // 雇用条件書（フェーズ1・MVP無料公開）
+  EMPLOYMENT_CONTRACT // 雇用契約書（フェーズ1・MVP無料公開）
+  SOCIAL_INSURANCE_PAYMENT_APPLICATION // 社会保険料納入確認申請書（フェーズ2）
+  LABOR_INSURANCE_PAYMENT_CERTIFICATE // 労働保険料等納付証明書 申請書部分（フェーズ2）
+  RESIDENCE_STATUS_CHANGE_APPLICATION // 在留資格変更許可申請書（フェーズ2・表紙転記のみ）
+  CERTIFICATE_OF_ELIGIBILITY_APPLICATION // 認定証明書交付申請書（フェーズ2・表紙転記のみ）
+  SUPPORT_PLAN // 支援計画書（フェーズ4・自由書式B案本命機能）
+  REMUNERATION_EXPLANATION_DOCUMENT // 特定技能外国人の報酬に関する説明書（フェーズ5）
 
-  @@index([tenantId])
+  @@schema("tokutei_ginou")
+}
+
+enum DocumentCaseStatus {
+  DRAFT // 行政書士・登録支援機関による代理入力段階
+  PENDING_APPROVAL
+  APPROVED // 受入企業側の承認済み。提出可能な状態
+  SUBMITTED
+
+  @@schema("tokutei_ginou")
+}
+
+model TokuteiGinouDocumentCase {
+  id                String   @id @default(uuid())
+  tenantId          String
+  foreignWorkerId   String
+  foreignWorker     ForeignWorker @relation(fields: [foreignWorkerId], references: [id])
+  documentType      TokuteiGinouDocumentType
+  templateVersion   String? // 様式のバージョン（施行日・改正日をキーにした管理、5章）
+  status            DocumentCaseStatus @default(DRAFT)
+  // マージタグ→値のデータ辞書相当（4.7章）。実際のフォーム項目は書類ごとに
+  // 異なるためJSONBで保持し、帳票生成時にchouhyou-engineへそのまま渡す。
+  formData          Json
+  createdByUserId   String
+  approvedByUserId  String?
+  approvedAt        DateTime?
+  submittedAt       DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([tenantId, documentType])
   @@index([foreignWorkerId])
   @@schema("tokutei_ginou")
 }
 
-// ---------------------------------------------------------------------------
-// ikusei_shurou: 育成就労ドメイン
-// ---------------------------------------------------------------------------
-
-model TrainingPlan {
-  id              String   @id @default(uuid())
+// 6章：健康診断書は要配慮個人情報（病歴等）に該当する唯一のケース。
+// 「完了／未完了＋完了日」のステータスのみを保持し、受診結果等の入力内容は
+// このテーブルにも他のどこにも保存しない（ステートレス生成方式）。
+// ファイル添付機能はこの書類には設けない。CSV一括インポート／エクスポート対象外。
+model HealthCheckupProgress {
+  id              String    @id @default(uuid())
   tenantId        String
   foreignWorkerId String
-  status          String   @default("DRAFT")
+  foreignWorker   ForeignWorker @relation(fields: [foreignWorkerId], references: [id])
+  status          String    @default("NOT_STARTED") // NOT_STARTED / DONE のみ
+  completedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([tenantId, foreignWorkerId])
+  @@schema("tokutei_ginou")
+}
+
+// 9章：添付管理のみの書類（帳票生成の対象外）は、通知なしの軽量な進捗
+// チェックリスト機能として切り出す。健康診断書と異なり要配慮個人情報を
+// 含まないため、ファイル添付（fileRef）を許容する。
+enum AttachmentDocumentKey {
+  SKILL_EXAM_CERTIFICATE_COPY // 合格証明書の写し
+  PASSPORT_COPY
+  RESIDENCE_CARD_COPY
+  CORPORATE_REGISTRY_CERTIFICATE // 登記事項証明書
+  RESIDENT_CERTIFICATE // 住民票
+  FINANCIAL_STATEMENTS // 決算書
+  HOME_COUNTRY_ISSUED_DOCUMENT // 本国発行書類
+
+  @@schema("tokutei_ginou")
+}
+
+model AttachmentChecklistItem {
+  id              String    @id @default(uuid())
+  tenantId        String
+  foreignWorkerId String
+  foreignWorker   ForeignWorker @relation(fields: [foreignWorkerId], references: [id])
+  documentKey     AttachmentDocumentKey
+  status          String    @default("NOT_STARTED")
+  completedAt     DateTime?
+  fileRef         String? // S3キー等
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([tenantId, foreignWorkerId, documentKey])
+  @@schema("tokutei_ginou")
+}
+
+// =============================================================================
+// ikusei_shurou: 育成就労ドメイン
+// 育成就労は2027年4月1日施行予定でありながら詳細な必要書類がまだ具体化されて
+// いないため（背景・9章参照）、tokutei_ginouのような汎用ケースモデルへの
+// 一般化は「実際の痛みが出た時点で行う」方針（4章）に従い、現時点では最小限の
+// 骨格に留める。
+// =============================================================================
+
+model TrainingPlan {
+  id              String    @id @default(uuid())
+  tenantId        String
+  foreignWorkerId String
+  status          String    @default("DRAFT")
   startDate       DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
   @@index([tenantId])
   @@index([foreignWorkerId])
   @@schema("ikusei_shurou")
 }
 
-// ---------------------------------------------------------------------------
+// =============================================================================
 // chouhyou: 帳票エンジン。他ドメインの事情を知らず「テンプレート×データ」の
 // 契約のみで完結させる（4章）。foreignWorkerId等は不透明な参照文字列として
 // 保持し、外部キー・リレーションは張らない。
 // 要配慮個人情報を含む書類（健康診断書等）はステートレス生成とし、
 // このスキーマには保存しない（6章）。
-// ---------------------------------------------------------------------------
+// =============================================================================
 
 enum DocumentFormat {
   DOCX
@@ -198,6 +481,11 @@ model DocumentTemplate {
   format         DocumentFormat
   isUserProvided Boolean        @default(false)
   tenantId       String?
+  // 運営提供テンプレート（isUserProvided=false）: apps/apiにバンドルされた
+  // 資産ファイルへの相対パス（例: assets/templates/tokutei-ginou/xxx/v1.docx）。
+  // 様式改正時はこのファイルの差し替え＋新しいDocumentTemplate行の追加で対応する（4.7章）。
+  // ユーザー原本インポート（isUserProvided=true）: 将来的にS3キーを保持する想定（4.7章）。
+  sourcePath     String?
   createdAt      DateTime       @default(now())
 
   generations DocumentGeneration[]
@@ -207,13 +495,13 @@ model DocumentTemplate {
 }
 
 model DocumentGeneration {
-  id               String           @id @default(uuid())
-  tenantId         String
-  templateId       String
-  template         DocumentTemplate @relation(fields: [templateId], references: [id])
-  generatedBy      String
-  generatedAt      DateTime         @default(now())
-  targetRefId      String? // 例: foreignWorkerId。他スキーマへのFKは張らない。
+  id          String           @id @default(uuid())
+  tenantId    String
+  templateId  String
+  template    DocumentTemplate @relation(fields: [templateId], references: [id])
+  generatedBy String
+  generatedAt DateTime         @default(now())
+  targetRefId String? // 例: TokuteiGinouDocumentCase.id。他スキーマへのFKは張らない。
 
   @@index([tenantId, generatedAt])
   @@schema("chouhyou")

@@ -4,3 +4,4 @@
 
 export * from "./dto/foreign-worker.dto";
 export * from "./dto/document.dto";
+export * from "./dto/tokutei-ginou-document-case.dto";

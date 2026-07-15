@@ -7,3 +7,5 @@ dist
 .env.local
 coverage
 prisma/generated
+packages/db/generated
+.DS_Store
