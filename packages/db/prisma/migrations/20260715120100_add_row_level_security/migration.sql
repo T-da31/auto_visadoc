@@ -16,6 +16,10 @@
 --      ロールで接続している限りRLSは効かないので注意）。
 --   3. current_setting('app.tenant_id', true) が未設定（NULL）の場合は
 --      全行が非該当となり、fail-closed（何も見えない）になる設計としている。
+--   4. Prismaの String @id @default(uuid()) はPostgreSQL上ではuuid型ではなく
+--      text型にマッピングされるため、tenantId/id列もtext型。比較はtext同士で
+--      行い、uuid型へのキャストは行わない（キャストするとtext = uuidの演算子が
+--      存在せずエラーになるため。実機検証で発見・修正した）。
 --
 -- 適用範囲外（意図的）：
 --   gaikokujinzai."ForeignWorker" / "IdentifierHistory" /
@@ -31,42 +35,42 @@
 ALTER TABLE "core"."Tenant" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "core"."Tenant" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "core"."Tenant"
-  USING ("id" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("id" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 ALTER TABLE "core"."User" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "core"."User" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "core"."User"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 ALTER TABLE "core"."Invitation" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "core"."Invitation" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "core"."Invitation"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 ALTER TABLE "core"."ProxyDataEntryGrant" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "core"."ProxyDataEntryGrant" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "core"."ProxyDataEntryGrant"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 ALTER TABLE "core"."AuditLog" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "core"."AuditLog" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "core"."AuditLog"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 ALTER TABLE "core"."ConsentRecord" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "core"."ConsentRecord" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "core"."ConsentRecord"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 ALTER TABLE "core"."Invoice" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "core"."Invoice" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "core"."Invoice"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 ALTER TABLE "core"."DataImportBatch" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "core"."DataImportBatch" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "core"."DataImportBatch"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 -- ============================================================
 -- gaikokujinzai（tenantId を持つテーブルのみ。ForeignWorker等は対象外）
@@ -75,12 +79,12 @@ CREATE POLICY tenant_isolation ON "core"."DataImportBatch"
 ALTER TABLE "gaikokujinzai"."Affiliation" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "gaikokujinzai"."Affiliation" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "gaikokujinzai"."Affiliation"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 ALTER TABLE "gaikokujinzai"."StatusChangeRequest" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "gaikokujinzai"."StatusChangeRequest" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "gaikokujinzai"."StatusChangeRequest"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 -- ============================================================
 -- tokutei_ginou
@@ -89,19 +93,19 @@ CREATE POLICY tenant_isolation ON "gaikokujinzai"."StatusChangeRequest"
 ALTER TABLE "tokutei_ginou"."TokuteiGinouDocumentCase" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "tokutei_ginou"."TokuteiGinouDocumentCase" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "tokutei_ginou"."TokuteiGinouDocumentCase"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 -- 健康診断書は要配慮個人情報を含まない（6章：ステータスのみ保持）が、
 -- 「誰の健康診断が完了したか」自体は他テナントに見せるべきではないため対象に含める。
 ALTER TABLE "tokutei_ginou"."HealthCheckupProgress" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "tokutei_ginou"."HealthCheckupProgress" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "tokutei_ginou"."HealthCheckupProgress"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 ALTER TABLE "tokutei_ginou"."AttachmentChecklistItem" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "tokutei_ginou"."AttachmentChecklistItem" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "tokutei_ginou"."AttachmentChecklistItem"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 -- ============================================================
 -- ikusei_shurou
@@ -110,7 +114,7 @@ CREATE POLICY tenant_isolation ON "tokutei_ginou"."AttachmentChecklistItem"
 ALTER TABLE "ikusei_shurou"."TrainingPlan" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "ikusei_shurou"."TrainingPlan" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "ikusei_shurou"."TrainingPlan"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
 
 -- ============================================================
 -- chouhyou
@@ -123,10 +127,10 @@ ALTER TABLE "chouhyou"."DocumentTemplate" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation_or_shared ON "chouhyou"."DocumentTemplate"
   USING (
     "tenantId" IS NULL
-    OR "tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+    OR "tenantId" = NULLIF(current_setting('app.tenant_id', true), '')
   );
 
 ALTER TABLE "chouhyou"."DocumentGeneration" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "chouhyou"."DocumentGeneration" FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON "chouhyou"."DocumentGeneration"
-  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+  USING ("tenantId" = NULLIF(current_setting('app.tenant_id', true), ''));
