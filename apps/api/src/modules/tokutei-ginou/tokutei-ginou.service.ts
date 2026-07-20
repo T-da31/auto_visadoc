@@ -1,5 +1,5 @@
 import { ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
-import { getPrismaClient } from "@tokutei-ginou/db";
+import { forTenant, getPrismaClient } from "@tokutei-ginou/db";
 import type {
   CreateTokuteiGinouDocumentCaseDto,
   TokuteiGinouDocumentCaseDto,
@@ -25,15 +25,18 @@ const TEMPLATE_KEY_BY_DOCUMENT_TYPE: Partial<Record<TokuteiGinouDocumentType, st
 export class TokuteiGinouService {
   constructor(private readonly chouhyou: ChouhyouService) {}
 
-  private get prisma() {
-    return getPrismaClient();
+  // RLS（4.5章）が参照する app.tenant_id を、クエリと同一トランザクション内で
+  // 設定してから実行するテナントスコープのクライアントを都度生成する。
+  // 呼び出し側からtenantIdが渡されない限りこのモジュールはDBへ触れられない。
+  private prismaFor(tenantId: string) {
+    return forTenant(getPrismaClient(), tenantId);
   }
 
   async listByTenant(
     tenantId: string,
     documentType?: string,
   ): Promise<TokuteiGinouDocumentCaseDto[]> {
-    return this.prisma.tokuteiGinouDocumentCase.findMany({
+    return this.prismaFor(tenantId).tokuteiGinouDocumentCase.findMany({
       where: { tenantId, ...(documentType ? { documentType } : {}) },
       orderBy: { createdAt: "desc" },
     });
@@ -44,7 +47,7 @@ export class TokuteiGinouService {
     createdByUserId: string,
     input: CreateTokuteiGinouDocumentCaseDto,
   ): Promise<TokuteiGinouDocumentCaseDto> {
-    return this.prisma.tokuteiGinouDocumentCase.create({
+    return this.prismaFor(tenantId).tokuteiGinouDocumentCase.create({
       data: {
         tenantId,
         foreignWorkerId: input.foreignWorkerId,
@@ -65,7 +68,8 @@ export class TokuteiGinouService {
     caseId: string,
     approvedByUserId: string,
   ): Promise<TokuteiGinouDocumentCaseDto> {
-    const documentCase = await this.prisma.tokuteiGinouDocumentCase.findFirst({
+    const prisma = this.prismaFor(tenantId);
+    const documentCase = await prisma.tokuteiGinouDocumentCase.findFirst({
       where: { id: caseId, tenantId },
     });
 
@@ -77,7 +81,7 @@ export class TokuteiGinouService {
       throw new ForbiddenException("提出済みの書類は承認できません");
     }
 
-    return this.prisma.tokuteiGinouDocumentCase.update({
+    return prisma.tokuteiGinouDocumentCase.update({
       where: { id: caseId },
       data: {
         status: "APPROVED",
@@ -94,7 +98,7 @@ export class TokuteiGinouService {
     generatedByUserId: string,
     caseId: string,
   ): Promise<GeneratedDocument> {
-    const documentCase = await this.prisma.tokuteiGinouDocumentCase.findFirst({
+    const documentCase = await this.prismaFor(tenantId).tokuteiGinouDocumentCase.findFirst({
       where: { id: caseId, tenantId },
     });
 

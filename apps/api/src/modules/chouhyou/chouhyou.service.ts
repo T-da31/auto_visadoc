@@ -1,7 +1,7 @@
 import { Injectable, NotFoundException } from "@nestjs/common";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getPrismaClient } from "@tokutei-ginou/db";
+import { forTenant, getPrismaClient } from "@tokutei-ginou/db";
 import { generateDocument } from "@tokutei-ginou/chouhyou-engine";
 import type {
   DocumentGenerationRequestDto,
@@ -28,8 +28,13 @@ function toEngineFormat(format: DocumentGenerationRequestDto["format"]): "docx" 
 // （@tokutei-ginou/chouhyou-engine）に委譲する。
 @Injectable()
 export class ChouhyouService {
-  private get prisma() {
-    return getPrismaClient();
+  // RLS（4.5章）が参照するapp.tenant_idを設定してから実行するテナント
+  // スコープのクライアントを都度生成する。DocumentTemplateはtenantIdが
+  // NULL許容（運営提供テンプレートは全テナント共有）だが、テナント
+  // スコープで実行しても`tenant_isolation_or_shared`ポリシーにより
+  // 共有テンプレート＋自テナントのユーザー原本テンプレートの両方が見える。
+  private prismaFor(tenantId: string) {
+    return forTenant(getPrismaClient(), tenantId);
   }
 
   async generate(
@@ -37,7 +42,8 @@ export class ChouhyouService {
     generatedBy: string,
     request: DocumentGenerationRequestDto,
   ): Promise<GeneratedDocument> {
-    const template = await this.prisma.documentTemplate.findFirst({
+    const prisma = this.prismaFor(tenantId);
+    const template = await prisma.documentTemplate.findFirst({
       where: {
         key: request.templateKey,
         ...(request.templateVersion
@@ -71,7 +77,7 @@ export class ChouhyouService {
       data: request.data,
     });
 
-    const generation = await this.prisma.documentGeneration.create({
+    const generation = await prisma.documentGeneration.create({
       data: {
         tenantId,
         templateId: template.id,

@@ -27,3 +27,5 @@ export function getPrismaClient() {
   }
   return prismaSingleton;
 }
+
+export { forTenant } from "./tenant-context";
